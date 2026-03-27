@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Command Center | CivicPulse</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.heat/0.2.0/leaflet-heat.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap');
+        body { font-family: 'Plus Jakarta Sans', sans-serif; background-color: #f8fafc; transition: background-color 0.3s, color 0.3s; }
+        .status-badge { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 9999px; text-transform: uppercase; }
+        .nav-item.active { background: #eff6ff; color: #2563eb; border-left: 4px solid #2563eb; }
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        /* Dark mode styles */
+        .dark body { background-color: #0f172a; color: #f1f5f9; }
+        .dark .bg-white { background-color: #1e293b; }
+        .dark .bg-slate-50 { background-color: #0f172a; }
+        .dark .border-slate-200 { border-color: #334155; }
+        .dark .text-slate-500 { color: #94a3b8; }
+        .dark .text-slate-600 { color: #cbd5e1; }
+        .dark .bg-slate-100 { background-color: #334155; }
+        .dark .text-slate-400 { color: #94a3b8; }
+        .dark .shadow-sm { box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.3); }
+        .dark .nav-item.active { background: #1e293b; color: #60a5fa; border-left-color: #60a5fa; }
+        /* Modal overlay - increased z-index to sit above map */
+        .modal-overlay {
+            background-color: rgba(0, 0, 0, 0.9);
+            z-index: 1000 !important;
+        }
+        .dark .modal-overlay {
+            background-color: rgba(0, 0, 0, 0.95);
+        }
+        /* Ensure image modal also has higher z-index */
+        #imageModal {
+            z-index: 1100 !important;
+        }
+    </style>
+</head>
+<body class="text-slate-900 h-screen flex flex-col md:flex-row overflow-hidden dark:bg-slate-900 dark:text-white">
+
+    <!-- LOGIN OVERLAY -->
+    <div id="login-overlay" class="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 hidden">
+        <div class="bg-white dark:bg-slate-800 rounded-3xl shadow-2xl max-w-md w-full p-8">
+            <h2 class="text-2xl font-extrabold text-center mb-2 dark:text-white">Admin Login</h2>
+            <p class="text-sm text-slate-500 text-center mb-6 dark:text-slate-400">Command Center access only</p>
+            <div class="space-y-5">
+                <div>
+                    <label class="block text-xs font-bold text-slate-400 uppercase mb-2">Email</label>
+                    <input type="email" id="login-email" class="w-full bg-slate-50 dark:bg-slate-700 border border-slate-200 dark:border-slate-600 p-4 rounded-2xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none dark:text-white" placeholder="admin@civicpulse.org">
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-slate-400 uppercase mb-2">Password</label>
+                    <input type="password" id="login-password" class="w-full bg-slate-50 dark:bg-slate-700 border border-slate-200 dark:border-slate-600 p-4 rounded-2xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none dark:text-white" placeholder="••••••••">
+                </div>
+                <button id="login-btn" class="w-full bg-gradient-to-r from-indigo-600 to-blue-600 text-white py-4 rounded-2xl font-bold shadow-lg shadow-indigo-100 hover:shadow-xl hover:scale-105 transition-all duration-300">Login</button>
+                <p class="text-xs text-slate-400 text-center">Default: admin@civicpulse.org / admin123</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- MAIN APP -->
+    <div id="main-app" class="hidden flex-1 flex flex-col md:flex-row overflow-hidden h-screen">
+        <!-- SIDEBAR -->
+        <aside class="w-full md:w-72 bg-white dark:bg-slate-800 border-r border-slate-200 dark:border-slate-700 flex flex-col shrink-0">
+            <div class="p-6 flex items-center justify-between">
+                <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center text-white shadow-lg">
+                        <i class="fas fa-shield-halved"></i>
+                    </div>
+                    <div>
+                        <h2 class="font-extrabold text-lg leading-none dark:text-white">CivicPulse</h2>
+                        <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">Command Center</p>
+                    </div>
+                </div>
+                <button id="darkModeToggleAdmin" class="p-2 rounded-full hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors">
+                    <i class="fas fa-moon dark:hidden"></i>
+                    <i class="fas fa-sun hidden dark:inline"></i>
+                </button>
+            </div>
+
+            <nav class="flex-1 px-4 mt-4 space-y-1" id="admin-nav">
+                <div class="nav-item active flex items-center gap-3 p-3 rounded-xl cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-700 transition-all font-semibold text-sm text-slate-600 dark:text-slate-300" data-view="dashboard">
+                    <i class="fas fa-chart-pie w-5"></i> Live Dashboard
+                </div>
+                <div class="nav-item flex items-center gap-3 p-3 rounded-xl cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-700 transition-all font-semibold text-sm text-slate-600 dark:text-slate-300" data-view="queue">
+                    <i class="fas fa-list-check w-5"></i> Service Queue
+                </div>
+                <div class="nav-item flex items-center gap-3 p-3 rounded-xl cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-700 transition-all font-semibold text-sm text-slate-600 dark:text-slate-300" data-view="reports">
+                    <i class="fas fa-file-invoice w-5"></i> Report Export
+                </div>
+            </nav>
+
+            <div class="p-4 mt-auto border-t border-slate-100 dark:border-slate-700">
+                <div class="bg-slate-50 dark:bg-slate-700 p-4 rounded-2xl flex items-center gap-3">
+                    <div class="w-10 h-10 rounded-full bg-indigo-100 dark:bg-indigo-900 flex items-center justify-center text-indigo-600 dark:text-indigo-300 font-bold" id="user-initials">AR</div>
+                    <div class="overflow-hidden">
+                        <p class="text-sm font-bold truncate dark:text-white" id="user-name">Admin Root</p>
+                        <p class="text-[10px] text-slate-400 font-bold uppercase">Administrator</p>
+                    </div>
+                    <button onclick="logout()" class="ml-auto text-slate-400 hover:text-red-500 transition-colors">
+                        <i class="fas fa-sign-out-alt"></i>
+                    </button>
+                </div>
+            </div>
+        </aside>
+
+        <!-- MAIN CONTENT -->
+        <main class="flex-1 overflow-y-auto bg-slate-50 dark:bg-slate-900 custom-scrollbar p-4 md:p-8" id="content-mount">
+            <!-- Dynamic content injected here -->
+        </main>
+    </div>
+
+    <!-- Toast Notification -->
+    <div id="toast-notification" class="fixed top-4 right-4 bg-white dark:bg-slate-800 rounded-lg shadow-lg p-4 hidden z-50 max-w-sm border-l-4 border-blue-500">
+        <div class="flex items-start gap-3">
+            <i class="fas fa-bell text-blue-500 mt-0.5"></i>
+            <div>
+                <p class="font-bold text-sm dark:text-white">New Complaint</p>
+                <p id="toast-message" class="text-xs text-slate-500 dark:text-slate-400"></p>
+            </div>
+            <button onclick="closeToast()" class="ml-auto text-slate-400 hover:text-slate-600 dark:hover:text-white"><i class="fas fa-times"></i></button>
+        </div>
+    </div>
+
+    <!-- Image Modal -->
+    <div id="imageModal" class="fixed inset-0 z-[1100] bg-black/80 flex items-center justify-center p-4 hidden">
+        <div class="relative bg-white dark:bg-slate-800 rounded-3xl max-w-4xl max-h-[90vh] overflow-auto">
+            <button id="closeModal" class="absolute top-4 right-4 text-white bg-black/50 rounded-full p-2 hover:bg-black/70 transition">
+                <i class="fas fa-times"></i>
+            </button>
+            <img id="modalImage" src="" alt="Complaint image" class="w-full h-auto rounded-3xl">
+        </div>
+    </div>
+
+    <!-- Complaint Detail Modal -->
+    <div id="complaintModal" class="fixed inset-0 z-[1000] modal-overlay flex items-center justify-center p-4 hidden overflow-y-auto">
+        <div class="relative bg-white dark:bg-slate-800 rounded-3xl max-w-4xl w-full max-h-[90vh] overflow-auto shadow-2xl">
+            <button id="closeComplaintModal" class="absolute top-4 right-4 text-white bg-black/50 rounded-full p-2 hover:bg-black/70 transition z-10">
+                <i class="fas fa-times"></i>
+            </button>
+            <div class="p-6">
+                <h3 class="text-2xl font-bold mb-4 dark:text-white">Complaint Details</h3>
+                <div id="complaintDetailContent">
+                    <!-- Dynamic content injected here -->
+                </div>
+                <div class="mt-6 flex justify-end gap-3">
+                    <button id="modalResolveBtn" class="bg-gradient-to-r from-green-600 to-emerald-600 text-white px-6 py-2 rounded-xl font-bold shadow-md hover:shadow-xl hover:scale-105 transition-all duration-300 hidden">Resolve</button>
+                    <button id="closeModalBtn" class="bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 px-6 py-2 rounded-xl font-bold hover:bg-slate-300 dark:hover:bg-slate-600 transition-all">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        (function() {
+            // ---------- USER & AUTH ----------
+            const USERS_KEY = 'civicpulse_users';
+            const SESSION_KEY = 'civicpulse_session';
+            const COMPLAINTS_KEY = 'civicpulse_complaints';
+            const DARK_MODE_KEY = 'civicpulse_dark_mode';
+
+            function seedAdmin() {
+                let users = JSON.parse(localStorage.getItem(USERS_KEY)) || [];
+                if (!users.some(u => u.role === 'admin')) {
+                    users.push({
+                        id: 1,
+                        name: 'Admin Root',
+                        email: 'admin@civicpulse.org',
+                        password: 'admin123',
+                        role: 'admin',
+                        phone: ''
+                    });
+                    localStorage.setItem(USERS_KEY, JSON.stringify(users));
+                }
+            }
+            seedAdmin();
+
+            function getSession() { return JSON.parse(sessionStorage.getItem(SESSION_KEY)); }
+            function setSession(user) { sessionStorage.setItem(SESSION_KEY, JSON.stringify(user)); }
+            function clearSession() { sessionStorage.removeItem(SESSION_KEY); }
+
+            function requireAuth() {
+                const session = getSession();
+                const overlay = document.getElementById('login-overlay');
+                const mainApp = document.getElementById('main-app');
+                if (!session || session.role !== 'admin') {
+                    overlay.classList.remove('hidden');
+                    mainApp.classList.add('hidden');
+                    return false;
+                } else {
+                    document.getElementById('user-name').innerText = session.name;
+                    document.getElementById('user-initials').innerText = session.name.split(' ').map(n => n[0]).join('').substring(0,2).toUpperCase();
+                    overlay.classList.add('hidden');
+                    mainApp.classList.remove('hidden');
+                    return true;
+                }
+            }
+
+            function login(email, password) {
+                const users = JSON.parse(localStorage.getItem(USERS_KEY)) || [];
+                const user = users.find(u => u.email === email && u.password === password);
+                if (user && user.role === 'admin') {
+                    setSession(user);
+                    location.reload();
+                    return true;
+                }
+                return false;
+            }
+            window.logout = function() { clearSession(); location.reload(); };
+
+            // ---------- COMPLAINTS DATA ----------
+            function getComplaints() { return JSON.parse(localStorage.getItem(COMPLAINTS_KEY)) || []; }
+            function saveComplaints(complaints) { localStorage.setItem(COMPLAINTS_KEY, JSON.stringify(complaints)); }
+
+            // ---------- PRIORITY SYSTEM ----------
+            function computePriority(complaint) {
+                const urgency = complaint.urgency;
+                const createdAt = complaint.date ? new Date(complaint.date) : new Date();
+                const now = new Date();
+                const ageHours = (now - createdAt) / (1000 * 3600);
+                let score = urgency;
+                if (ageHours > 72) score += 2;
+                else if (ageHours > 24) score += 1;
+                if (urgency >= 8) score += 2;
+                if (score >= 9) return 'CRITICAL';
+                if (score >= 5) return 'MEDIUM';
+                return 'LOW';
+            }
+            function getPriorityClass(priority) {
+                switch(priority) {
+                    case 'CRITICAL': return 'bg-red-100 text-red-700';
+                    case 'MEDIUM':   return 'bg-yellow-100 text-yellow-700';
+                    default:         return 'bg-green-100 text-green-700';
+                }
+            }
+
+            // ---------- NOTIFICATION ----------
+            let currentView = 'dashboard';
+            let isModalOpen = false;
+
+            function showToast(complaint) {
+                const toast = document.getElementById('toast-notification');
+                const msg = document.getElementById('toast-message');
+                msg.innerText = `${complaint.desc.substring(0,50)} - ${complaint.ward}`;
+                toast.classList.remove('hidden');
+                setTimeout(() => toast.classList.add('hidden'), 5000);
+            }
+            window.closeToast = () => document.getElementById('toast-notification').classList.add('hidden');
+
+            window.addEventListener('storage', function(e) {
+                if (isModalOpen) return;
+                if (e.key === COMPLAINTS_KEY) {
+                    const oldComplaints = JSON.parse(e.oldValue) || [];
+                    const newComplaints = JSON.parse(e.newValue) || [];
+                    if (newComplaints.length > oldComplaints.length) {
+                        const added = newComplaints.find(c => !oldComplaints.some(o => o.id === c.id));
+                        if (added && added.status === 'pending') showToast(added);
+                    }
+                    if (currentView === 'dashboard') renderDashboard();
+                    else if (currentView === 'queue') renderQueue();
+                    else if (currentView === 'reports') renderReports();
+                }
+            });
+
+            // ---------- MODAL ----------
+            window.showImageModal = function(src) {
+                document.getElementById('modalImage').src = src;
+                document.getElementById('imageModal').classList.remove('hidden');
+            };
+            document.getElementById('closeModal')?.addEventListener('click', () => {
+                document.getElementById('imageModal').classList.add('hidden');
+            });
+            document.getElementById('imageModal')?.addEventListener('click', (e) => {
+                if (e.target === document.getElementById('imageModal')) {
+                    document.getElementById('imageModal').classList.add('hidden');
+                }
+            });
+
+            // ---------- COMPLAINT DETAIL MODAL ----------
+            let currentComplaintId = null;
+
+            function showComplaintDetails(id) {
+                const complaints = getComplaints();
+                const complaint = complaints.find(c => c.id === id);
+                if (!complaint) return;
+
+                currentComplaintId = id;
+                const modal = document.getElementById('complaintModal');
+                const contentDiv = document.getElementById('complaintDetailContent');
+                const resolveBtn = document.getElementById('modalResolveBtn');
+
+                let imagesHtml = '';
+                if (complaint.images && complaint.images.length > 0) {
+                    imagesHtml = '<div class="mb-4"><p class="font-bold mb-2 dark:text-white">Images:</p><div class="flex flex-wrap gap-2">';
+                    complaint.images.forEach(img => {
+                        imagesHtml += `<img src="${img}" class="w-24 h-24 object-cover rounded-lg cursor-pointer" onclick="showImageModal('${img}')">`;
+                    });
+                    imagesHtml += '</div></div>';
+                }
+
+                const mapId = `modal-map-${Date.now()}`;
+                const mapHtml = `<div id="${mapId}" class="h-64 rounded-xl overflow-hidden border border-slate-200 dark:border-slate-700 mb-4"></div>`;
+
+                contentDiv.innerHTML = `
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                            <p><span class="font-bold">Description:</span> ${complaint.desc}</p>
+                            <p><span class="font-bold">Category:</span> ${complaint.category} ${complaint.subCategory ? `(${complaint.subCategory})` : ''}</p>
+                            <p><span class="font-bold">Ward:</span> ${complaint.ward}</p>
+                            <p><span class="font-bold">Urgency:</span> ${complaint.urgency}/10</p>
+                            <p><span class="font-bold">Status:</span> <span class="status-badge ${complaint.status === 'resolved' ? 'bg-emerald-100 text-emerald-700' : 'bg-orange-100 text-orange-700'}">${complaint.status}</span></p>
+                            <p><span class="font-bold">Date:</span> ${complaint.date}</p>
+                            <p><span class="font-bold">Address:</span> ${complaint.address || 'Not provided'}</p>
+                            <p><span class="font-bold">Assigned To:</span> ${complaint.assignedTo || 'Not assigned'}</p>
+                            ${complaint.proof ? `<p><span class="font-bold">Resolution Proof:</span> ${complaint.proof}</p>` : ''}
+                            ${complaint.resolvedBy ? `<p><span class="font-bold">Resolved By:</span> ${complaint.resolvedBy}</p>` : ''}
+                        </div>
+                        <div>
+                            ${imagesHtml}
+                            ${mapHtml}
+                        </div>
+                    </div>
+                    ${complaint.timeline ? `
+                    <div class="mt-4">
+                        <p class="font-bold mb-2 dark:text-white">Timeline:</p>
+                        <ul class="list-disc list-inside text-sm text-slate-600 dark:text-slate-400">
+                            ${complaint.timeline.map(event => `<li>${event.event} at ${new Date(event.timestamp).toLocaleString()}</li>`).join('')}
+                        </ul>
+                    </div>
+                    ` : ''}
+                `;
+
+                modal.classList.remove('hidden');
+                isModalOpen = true;
+
+                setTimeout(() => {
+                    const mapContainer = document.getElementById(mapId);
+                    if (mapContainer && complaint.lat && complaint.lng) {
+                        // Destroy any existing map instance
+                        if (mapContainer._leaflet_id) {
+                            const existingMap = mapContainer._leaflet_map;
+                            if (existingMap) existingMap.remove();
+                        }
+                        const map = L.map(mapContainer).setView([complaint.lat, complaint.lng], 15);
+                        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                            attribution: '© OpenStreetMap contributors'
+                        }).addTo(map);
+                        L.marker([complaint.lat, complaint.lng]).addTo(map)
+                            .bindPopup('Complaint Location')
+                            .openPopup();
+                        mapContainer._leaflet_map = map;
+                    } else if (mapContainer) {
+                        mapContainer.innerHTML = '<p class="text-center text-slate-500">Location not available</p>';
+                    }
+                }, 100);
+
+                if (complaint.status === 'pending') {
+                    resolveBtn.classList.remove('hidden');
+                } else {
+                    resolveBtn.classList.add('hidden');
+                }
+            }
+
+            function closeComplaintModal() {
+                document.getElementById('complaintModal').classList.add('hidden');
+                currentComplaintId = null;
+                isModalOpen = false;
+            }
+
+            window.showComplaintDetails = showComplaintDetails;
+            window.closeComplaintModal = closeComplaintModal;
+
+            document.getElementById('closeComplaintModal')?.addEventListener('click', closeComplaintModal);
+            document.getElementById('closeModalBtn')?.addEventListener('click', closeComplaintModal);
+            document.getElementById('modalResolveBtn')?.addEventListener('click', () => {
+                if (currentComplaintId) {
+                    resolveComplaint(currentComplaintId);
+                    closeComplaintModal();
+                }
+            });
+
+            // ---------- RENDERING ----------
+            const mount = document.getElementById('content-mount');
+
+            function statCard(title, value, icon, colorClass) {
+                return `
+                    <div class="bg-white dark:bg-slate-800 p-6 rounded-3xl border border-slate-200 dark:border-slate-700 shadow-sm hover:shadow-lg hover:-translate-y-1 transition-all duration-300 flex items-center gap-5">
+                        <div class="w-12 h-12 rounded-2xl flex items-center justify-center text-xl ${colorClass}">
+                            <i class="fas ${icon}"></i>
+                        </div>
+                        <div>
+                            <p class="text-xs font-bold text-slate-400 uppercase tracking-widest">${title}</p>
+                            <p class="text-2xl font-black text-slate-800 dark:text-white">${value}</p>
+                        </div>
+                    </div>
+                `;
+            }
+
+            function renderDashboard() {
+                const complaints = getComplaints();
+                const total = complaints.length;
+                const pending = complaints.filter(c => c.status === 'pending').length;
+                const resolved = complaints.filter(c => c.status === 'resolved').length;
+                const overdue = complaints.filter(c => c.status === 'pending' && new Date(c.date) < new Date(Date.now() - 3*24*60*60*1000)).length;
+
+                const pendingComplaints = complaints.filter(c => c.status === 'pending');
+                const wardCounts = {};
+                pendingComplaints.forEach(c => { wardCounts[c.ward] = (wardCounts[c.ward] || 0) + 1; });
+                let wardWithMost = { ward: null, count: 0 };
+                for (const [ward, count] of Object.entries(wardCounts)) {
+                    if (count > wardWithMost.count) wardWithMost = { ward, count };
+                }
+                const categoryCounts = {};
+                pendingComplaints.forEach(c => { categoryCounts[c.category] = (categoryCounts[c.category] || 0) + 1; });
+                let topCategory = { category: null, count: 0 };
+                for (const [cat, count] of Object.entries(categoryCounts)) {
+                    if (count > topCategory.count) topCategory = { category: cat, count };
+                }
+                const urgentCount = pendingComplaints.filter(c => c.urgency >= 8).length;
+
+                const priorityOrder = { 'CRITICAL': 0, 'MEDIUM': 1, 'LOW': 2 };
+                const sortedPending = [...pendingComplaints].sort((a,b) => {
+                    const aPriority = computePriority(a);
+                    const bPriority = computePriority(b);
+                    return priorityOrder[aPriority] - priorityOrder[bPriority];
+                });
+                const topPending = sortedPending.slice(0,5);
+
+                mount.innerHTML = `
+                    <div class="space-y-8">
+                        <header class="flex justify-between items-end">
+                            <div>
+                                <h1 class="text-3xl font-extrabold text-slate-900 dark:text-white">Control Center</h1>
+                                <p class="text-slate-500 dark:text-slate-400">Real-time municipal performance & AI dispatch metrics.</p>
+                            </div>
+                            <button id="export-csv" class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-4 py-2 rounded-xl text-xs font-bold text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700">
+                                <i class="fas fa-file-export mr-2"></i> Export CSV
+                            </button>
+                        </header>
+
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                            ${statCard('Total Tickets', total, 'fa-ticket', 'bg-blue-50 text-blue-600 dark:bg-blue-900/30')}
+                            ${statCard('Pending', pending, 'fa-clock', 'bg-orange-50 text-orange-600 dark:bg-orange-900/30')}
+                            ${statCard('Overdue', overdue, 'fa-triangle-exclamation', 'bg-red-50 text-red-600 dark:bg-red-900/30')}
+                            ${statCard('Resolved', resolved, 'fa-bolt', 'bg-emerald-50 text-emerald-600 dark:bg-emerald-900/30')}
+                        </div>
+
+                        <div class="grid grid-cols-1 xl:grid-cols-3 gap-8">
+                            <div class="xl:col-span-2 bg-white dark:bg-slate-800 p-6 rounded-3xl border border-slate-200 dark:border-slate-700 shadow-sm">
+                                <h3 class="font-bold mb-6 text-slate-800 dark:text-white">Complaint Heatmap</h3>
+                                <div id="adminMap" class="h-80 rounded-xl overflow-hidden"></div>
+                            </div>
+                            <div class="bg-slate-900 p-6 rounded-3xl text-white">
+                                <h3 class="font-bold mb-4">AI Insights</h3>
+                                <div class="space-y-4">
+                                    <div class="bg-white/10 p-4 rounded-2xl">
+                                        <p class="text-[10px] uppercase font-bold text-blue-400 mb-1">Hotspot Alert</p>
+                                        <p class="text-xs text-slate-300">
+                                            ${wardWithMost.ward ? `Ward ${wardWithMost.ward} has the highest pending complaints (${wardWithMost.count})` : 'No pending complaints'}
+                                        </p>
+                                    </div>
+                                    <div class="bg-white/10 p-4 rounded-2xl">
+                                        <p class="text-[10px] uppercase font-bold text-amber-400 mb-1">Category Surge</p>
+                                        <p class="text-xs text-slate-300">
+                                            ${topCategory.category ? `${topCategory.category} issues are most common (${topCategory.count})` : 'No data'}
+                                        </p>
+                                    </div>
+                                    <div class="bg-white/10 p-4 rounded-2xl">
+                                        <p class="text-[10px] uppercase font-bold text-red-400 mb-1">Urgent Priority</p>
+                                        <p class="text-xs text-slate-300">
+                                            ${urgentCount} high urgency complaint${urgentCount !== 1 ? 's' : ''} require immediate attention.
+                                        </p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="bg-white dark:bg-slate-800 rounded-3xl border border-slate-200 dark:border-slate-700 shadow-sm overflow-hidden">
+                            <div class="p-6 border-b border-slate-50 dark:border-slate-700 flex justify-between items-center">
+                                <h3 class="font-bold dark:text-white">Pending Queue (${pending})</h3>
+                                <button onclick="setView('queue')" class="text-xs text-indigo-600 dark:text-indigo-400 font-semibold hover:underline">View All</button>
+                            </div>
+                            <table class="w-full text-left">
+                                <thead class="bg-slate-50 dark:bg-slate-800/50 text-[10px] font-bold uppercase tracking-widest text-slate-400">
+                                    <tr><th class="px-6 py-4">Image</th><th class="px-6 py-4">Complaint</th><th class="px-6 py-4">Ward</th><th class="px-6 py-4">Priority</th><th class="px-6 py-4">Action</th> </tr>
+                                </thead>
+                                <tbody class="text-sm divide-y divide-slate-50 dark:divide-slate-700">
+                                    ${topPending.map(c => `
+                                        <tr class="hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors">
+                                            <td class="px-6 py-4">
+                                                ${c.images && c.images[0] ? 
+                                                    `<img src="${c.images[0]}" class="w-10 h-10 object-cover rounded-lg cursor-pointer" onclick="showImageModal('${c.images[0]}')">` :
+                                                    `<div class="w-10 h-10 bg-slate-100 dark:bg-slate-700 rounded-lg flex items-center justify-center text-slate-400"><i class="fas fa-image"></i></div>`
+                                                }
+                                             </td>
+                                            <td class="px-6 py-4 font-bold text-slate-700 dark:text-white">${c.desc.substring(0,30)}${c.desc.length>30?'…':''}</td>
+                                            <td class="px-6 py-4 text-slate-500 dark:text-slate-400">${c.ward}</td>
+                                            <td class="px-6 py-4">
+                                                <span class="px-2 py-0.5 rounded-full text-[10px] font-black ${getPriorityClass(computePriority(c))}">
+                                                    ${computePriority(c)}
+                                                </span>
+                                             </td>
+                                            <td class="px-6 py-4"><button onclick="showComplaintDetails(${c.id})" class="bg-gradient-to-r from-indigo-600 to-blue-600 text-white text-[10px] font-bold px-3 py-1.5 rounded-lg hover:shadow-md hover:scale-105 transition-all duration-200">OPEN</button></td>
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                `;
+
+                document.getElementById('export-csv')?.addEventListener('click', exportCSV);
+
+                setTimeout(() => {
+                    if (isModalOpen) return;
+                    const mapDiv = document.getElementById('adminMap');
+                    if (mapDiv) {
+                        const map = L.map(mapDiv).setView([28.6139, 77.2090], 10);
+                        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                            attribution: '© OpenStreetMap contributors'
+                        }).addTo(map);
+                        const points = complaints.filter(c => c.lat && c.lng).map(c => [c.lat, c.lng, c.urgency]);
+                        if (points.length) {
+                            L.heatLayer(points, { radius: 20, blur: 15, maxZoom: 12 }).addTo(map);
+                        } else {
+                            L.marker([28.6139, 77.2090]).addTo(map).bindPopup('No complaints with location yet');
+                        }
+                    }
+                }, 100);
+            }
+
+            function renderQueue() {
+                const complaints = getComplaints().filter(c => c.status === 'pending');
+                const priorityOrder = { 'CRITICAL': 0, 'MEDIUM': 1, 'LOW': 2 };
+                const sortedPending = [...complaints].sort((a,b) => {
+                    const aPriority = computePriority(a);
+                    const bPriority = computePriority(b);
+                    return priorityOrder[aPriority] - priorityOrder[bPriority];
+                });
+                mount.innerHTML = `
+                    <div class="max-w-6xl mx-auto">
+                        <button id="back-dash" class="text-slate-400 dark:text-slate-500 hover:text-slate-800 dark:hover:text-white mb-6 flex items-center gap-2 text-sm font-bold">
+                            <i class="fas fa-arrow-left"></i> Back to Dashboard
+                        </button>
+                        <h2 class="text-2xl font-black mb-6 dark:text-white">Service Queue (${sortedPending.length} pending)</h2>
+                        <div class="bg-white dark:bg-slate-800 rounded-3xl border border-slate-200 dark:border-slate-700 shadow-sm overflow-hidden">
+                            <table class="w-full text-left">
+                                <thead class="bg-slate-50 dark:bg-slate-800/50 text-[10px] font-bold uppercase tracking-widest text-slate-400">
+                                    <tr><th class="px-6 py-4">ID</th><th class="px-6 py-4">Image</th><th class="px-6 py-4">Description</th><th class="px-6 py-4">Ward</th><th class="px-6 py-4">Category</th><th class="px-6 py-4">Urgency</th><th class="px-6 py-4">Date</th><th class="px-6 py-4">Priority</th><th class="px-6 py-4">Action</th> </tr>
+                                </thead>
+                                <tbody class="text-sm divide-y divide-slate-50 dark:divide-slate-700">
+                                    ${sortedPending.map(c => `
+                                        <tr class="hover:bg-slate-50 dark:hover:bg-slate-700/50">
+                                            <td class="px-6 py-4 font-mono text-xs dark:text-white">#${c.id}</td>
+                                            <td class="px-6 py-4">
+                                                ${c.images && c.images[0] ? 
+                                                    `<img src="${c.images[0]}" class="w-10 h-10 object-cover rounded-lg cursor-pointer" onclick="showImageModal('${c.images[0]}')">` :
+                                                    `<div class="w-10 h-10 bg-slate-100 dark:bg-slate-700 rounded-lg flex items-center justify-center text-slate-400"><i class="fas fa-image"></i></div>`
+                                                }
+                                             </td>
+                                            <td class="px-6 py-4 font-bold text-slate-700 dark:text-white">${c.desc}</td>
+                                            <td class="px-6 py-4 dark:text-slate-300">${c.ward}</td>
+                                            <td class="px-6 py-4 dark:text-slate-300">${c.category}</td>
+                                            <td class="px-6 py-4"><span class="px-2 py-0.5 rounded-full text-[10px] font-black ${c.urgency >= 4 ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'}">${c.urgency >= 4 ? 'HIGH' : 'LOW'}</span></td>
+                                            <td class="px-6 py-4 text-slate-500 dark:text-slate-400">${c.date}</td>
+                                            <td class="px-6 py-4">
+                                                <span class="px-2 py-0.5 rounded-full text-[10px] font-black ${getPriorityClass(computePriority(c))}">
+                                                    ${computePriority(c)}
+                                                </span>
+                                             </td>
+                                            <td class="px-6 py-4"><button onclick="showComplaintDetails(${c.id})" class="bg-gradient-to-r from-indigo-600 to-blue-600 text-white text-[10px] font-bold px-3 py-1.5 rounded-lg hover:shadow-md hover:scale-105 transition-all duration-200">OPEN</button></td>
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                `;
+                document.getElementById('back-dash').addEventListener('click', () => setView('dashboard'));
+            }
+
+            window.resolveComplaint = function(id) {
+                const complaints = getComplaints();
+                const complaint = complaints.find(c => c.id === id);
+                if (complaint) {
+                    const department = prompt('Enter resolving department (e.g., Water Department, Electricity Department):', complaint.category + ' Department');
+                    const proof = prompt('Enter resolution details (optional):');
+                    complaint.status = 'resolved';
+                    complaint.proof = proof || 'Resolved by admin.';
+                    complaint.resolvedBy = department || 'Admin';
+                    saveComplaints(complaints);
+                    setView(currentView);
+                }
+            };
+
+            function exportCSV() {
+                const complaints = getComplaints();
+                const headers = ['ID','Description','Ward','Category','Urgency','Status','Date','Proof','Resolved By'];
+                const rows = complaints.map(c => [c.id, c.desc, c.ward, c.category, c.urgency, c.status, c.date, c.proof || '', c.resolvedBy || '']);
+                let csv = headers.join(',') + '\n' + rows.map(r => r.map(v => `"${v}"`).join(',')).join('\n');
+                const blob = new Blob([csv], { type: 'text/csv' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'civicpulse_reports.csv';
+                a.click();
+            }
+
+            function renderReports() {
+                const complaints = getComplaints();
+                mount.innerHTML = `
+                    <div class="max-w-6xl mx-auto">
+                        <button id="back-dash" class="text-slate-400 dark:text-slate-500 hover:text-slate-800 dark:hover:text-white mb-6 flex items-center gap-2 text-sm font-bold">
+                            <i class="fas fa-arrow-left"></i> Back to Dashboard
+                        </button>
+                        <h2 class="text-2xl font-black mb-6 dark:text-white">Generate Report</h2>
+                        <div class="bg-white dark:bg-slate-800 p-8 rounded-3xl border border-slate-200 dark:border-slate-700 shadow-sm">
+                            <p class="text-slate-500 dark:text-slate-400 mb-4">Select date range and format.</p>
+                            <button onclick="exportCSV()" class="bg-gradient-to-r from-indigo-600 to-blue-600 text-white px-6 py-3 rounded-xl font-bold text-sm shadow-md hover:shadow-xl hover:scale-105 transition-all duration-300">Export as CSV</button>
+                        </div>
+                        <div class="mt-8">
+                            <h3 class="text-xl font-bold mb-4 dark:text-white">Complaint Data Preview</h3>
+                            <div class="bg-white dark:bg-slate-800 rounded-3xl border border-slate-200 dark:border-slate-700 shadow-sm overflow-hidden">
+                                <div class="overflow-x-auto">
+                                    <table class="w-full text-left">
+                                        <thead class="bg-slate-50 dark:bg-slate-800/50 text-[10px] font-bold uppercase tracking-widest text-slate-400">
+                                            <tr><th class="px-6 py-4">ID</th><th class="px-6 py-4">Description</th><th class="px-6 py-4">Ward</th><th class="px-6 py-4">Category</th><th class="px-6 py-4">Urgency</th><th class="px-6 py-4">Status</th><th class="px-6 py-4">Date</th><th class="px-6 py-4">Resolved By</th> </tr>
+                                        </thead>
+                                        <tbody class="text-sm divide-y divide-slate-50 dark:divide-slate-700">
+                                            ${complaints.map(c => `
+                                                <tr class="hover:bg-slate-50 dark:hover:bg-slate-700/50">
+                                                    <td class="px-6 py-4 font-mono text-xs">#${c.id}</td>
+                                                    <td class="px-6 py-4">${c.desc.substring(0,50)}${c.desc.length>50?'…':''}</td>
+                                                    <td class="px-6 py-4">${c.ward}</td>
+                                                    <td class="px-6 py-4">${c.category}</td>
+                                                    <td class="px-6 py-4">${c.urgency}/10</td>
+                                                    <td class="px-6 py-4"><span class="status-badge ${c.status === 'resolved' ? 'bg-emerald-100 text-emerald-700' : 'bg-orange-100 text-orange-700'}">${c.status}</span></td>
+                                                    <td class="px-6 py-4">${c.date}</td>
+                                                    <td class="px-6 py-4">${c.resolvedBy || '—'}</td>
+                                                </tr>
+                                            `).join('')}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                document.getElementById('back-dash').addEventListener('click', () => setView('dashboard'));
+            }
+
+            // Navigation
+            window.setView = function(view) {
+                currentView = view;
+                document.querySelectorAll('#admin-nav .nav-item').forEach(el => {
+                    if (el.dataset.view === view) el.classList.add('active');
+                    else el.classList.remove('active');
+                });
+                if (view === 'dashboard') renderDashboard();
+                else if (view === 'queue') renderQueue();
+                else if (view === 'reports') renderReports();
+            };
+
+            // Dark mode
+            function initDarkMode() {
+                const isDark = localStorage.getItem(DARK_MODE_KEY) === 'true';
+                if (isDark) document.documentElement.classList.add('dark');
+                const toggle = document.getElementById('darkModeToggleAdmin');
+                if (toggle) {
+                    toggle.addEventListener('click', () => {
+                        document.documentElement.classList.toggle('dark');
+                        localStorage.setItem(DARK_MODE_KEY, document.documentElement.classList.contains('dark'));
+                    });
+                }
+            }
+            initDarkMode();
+
+            // Auth UI
+            document.getElementById('login-btn').addEventListener('click', () => {
+                const email = document.getElementById('login-email').value;
+                const pass = document.getElementById('login-password').value;
+                if (!email || !pass) { alert('Please fill in both fields'); return; }
+                if (!login(email, pass)) alert('Invalid credentials or not an admin account.');
+            });
+
+            if (requireAuth()) {
+                document.querySelectorAll('#admin-nav .nav-item').forEach(el => {
+                    el.addEventListener('click', () => setView(el.dataset.view));
+                });
+                setView('dashboard');
+            }
+        })();
+
+        // Admin specific calls
+async function getDashboardStats() {
+    return await fetchAPI('/api/dashboard/stats');
+}
+async function getHeatmapData() {
+    return await fetchAPI('/api/heatmap');
+}
+async function exportCSV() {
+    window.location.href = '/api/export/csv';
+}
+async function resolveComplaint(id, proof, resolvedBy) {
+    return await fetchAPI(`/api/complaints/${id}/resolve`, {
+        method: 'PUT',
+        body: JSON.stringify({ proof, resolvedBy }),
+    });
+}
+    </script>
+</body>
+</html>
