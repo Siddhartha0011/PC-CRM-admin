@@ -1,627 +1,684 @@
 from __future__ import annotations
 
-import collections.abc as cabc
+import io
+import mimetypes
 import os
+import pkgutil
 import re
 import sys
 import typing as t
-from functools import update_wrapper
-from types import ModuleType
-from types import TracebackType
+import unicodedata
+from datetime import datetime
+from time import time
+from urllib.parse import quote
+from zlib import adler32
 
-from ._compat import _default_text_stderr
-from ._compat import _default_text_stdout
-from ._compat import _find_binary_writer
-from ._compat import auto_wrap_for_ansi
-from ._compat import binary_streams
-from ._compat import open_stream
-from ._compat import should_strip_ansi
-from ._compat import strip_ansi
-from ._compat import text_streams
-from ._compat import WIN
-from .globals import resolve_color_default
+from markupsafe import escape
+
+from ._internal import _DictAccessorProperty
+from ._internal import _missing
+from ._internal import _TAccessorValue
+from .datastructures import Headers
+from .exceptions import NotFound
+from .exceptions import RequestedRangeNotSatisfiable
+from .security import _windows_device_files
+from .security import safe_join
+from .wsgi import wrap_file
 
 if t.TYPE_CHECKING:
-    import typing_extensions as te
+    from _typeshed.wsgi import WSGIEnvironment
 
-    P = te.ParamSpec("P")
+    from .wrappers.request import Request
+    from .wrappers.response import Response
 
-R = t.TypeVar("R")
+_T = t.TypeVar("_T")
 
-
-def _posixify(name: str) -> str:
-    return "-".join(name.split()).lower()
-
-
-def safecall(func: t.Callable[P, R]) -> t.Callable[P, R | None]:
-    """Wraps a function so that it swallows exceptions."""
-
-    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R | None:
-        try:
-            return func(*args, **kwargs)
-        except Exception:
-            pass
-        return None
-
-    return update_wrapper(wrapper, func)
+_entity_re = re.compile(r"&([^;]+);")
+_filename_ascii_strip_re = re.compile(r"[^A-Za-z0-9_.-]")
 
 
-def make_str(value: t.Any) -> str:
-    """Converts a value into a valid string."""
-    if isinstance(value, bytes):
-        try:
-            return value.decode(sys.getfilesystemencoding())
-        except UnicodeError:
-            return value.decode("utf-8", "replace")
-    return str(value)
+class cached_property(property, t.Generic[_T]):
+    """A :func:`property` that is only evaluated once. Subsequent access
+    returns the cached value. Setting the property sets the cached
+    value. Deleting the property clears the cached value, accessing it
+    again will evaluate it again.
 
+    .. code-block:: python
 
-def make_default_short_help(help: str, max_length: int = 45) -> str:
-    """Returns a condensed version of help string."""
-    # Consider only the first paragraph.
-    paragraph_end = help.find("\n\n")
+        class Example:
+            @cached_property
+            def value(self):
+                # calculate something important here
+                return 42
 
-    if paragraph_end != -1:
-        help = help[:paragraph_end]
+        e = Example()
+        e.value  # evaluates
+        e.value  # uses cache
+        e.value = 16  # sets cache
+        del e.value  # clears cache
 
-    # Collapse newlines, tabs, and spaces.
-    words = help.split()
+    If the class defines ``__slots__``, it must add ``_cache_{name}`` as
+    a slot. Alternatively, it can add ``__dict__``, but that's usually
+    not desirable.
 
-    if not words:
-        return ""
+    .. versionchanged:: 2.1
+        Works with ``__slots__``.
 
-    # The first paragraph started with a "no rewrap" marker, ignore it.
-    if words[0] == "\b":
-        words = words[1:]
-
-    total_length = 0
-    last_index = len(words) - 1
-
-    for i, word in enumerate(words):
-        total_length += len(word) + (i > 0)
-
-        if total_length > max_length:  # too long, truncate
-            break
-
-        if word[-1] == ".":  # sentence end, truncate without "..."
-            return " ".join(words[: i + 1])
-
-        if total_length == max_length and i != last_index:
-            break  # not at sentence end, truncate with "..."
-    else:
-        return " ".join(words)  # no truncation needed
-
-    # Account for the length of the suffix.
-    total_length += len("...")
-
-    # remove words until the length is short enough
-    while i > 0:
-        total_length -= len(words[i]) + (i > 0)
-
-        if total_length <= max_length:
-            break
-
-        i -= 1
-
-    return " ".join(words[:i]) + "..."
-
-
-class LazyFile:
-    """A lazy file works like a regular file but it does not fully open
-    the file but it does perform some basic checks early to see if the
-    filename parameter does make sense.  This is useful for safely opening
-    files for writing.
+    .. versionchanged:: 2.0
+        ``del obj.name`` clears the cached value.
     """
 
     def __init__(
         self,
-        filename: str | os.PathLike[str],
-        mode: str = "r",
-        encoding: str | None = None,
-        errors: str | None = "strict",
-        atomic: bool = False,
+        fget: t.Callable[[t.Any], _T],
+        name: str | None = None,
+        doc: str | None = None,
+    ) -> None:
+        super().__init__(fget, doc=doc)
+        self.__name__ = name or fget.__name__
+        self.slot_name = f"_cache_{self.__name__}"
+        self.__module__ = fget.__module__
+
+    def __set__(self, obj: object, value: _T) -> None:
+        if hasattr(obj, "__dict__"):
+            obj.__dict__[self.__name__] = value
+        else:
+            setattr(obj, self.slot_name, value)
+
+    def __get__(self, obj: object, type: type = None) -> _T:  # type: ignore
+        if obj is None:
+            return self  # type: ignore
+
+        obj_dict = getattr(obj, "__dict__", None)
+
+        if obj_dict is not None:
+            value: _T = obj_dict.get(self.__name__, _missing)
+        else:
+            value = getattr(obj, self.slot_name, _missing)  # type: ignore[arg-type]
+
+        if value is _missing:
+            value = self.fget(obj)  # type: ignore
+
+            if obj_dict is not None:
+                obj.__dict__[self.__name__] = value
+            else:
+                setattr(obj, self.slot_name, value)
+
+        return value
+
+    def __delete__(self, obj: object) -> None:
+        if hasattr(obj, "__dict__"):
+            del obj.__dict__[self.__name__]
+        else:
+            setattr(obj, self.slot_name, _missing)
+
+
+class environ_property(_DictAccessorProperty[_TAccessorValue]):
+    """Maps request attributes to environment variables. This works not only
+    for the Werkzeug request object, but also any other class with an
+    environ attribute:
+
+    >>> class Test(object):
+    ...     environ = {'key': 'value'}
+    ...     test = environ_property('key')
+    >>> var = Test()
+    >>> var.test
+    'value'
+
+    If you pass it a second value it's used as default if the key does not
+    exist, the third one can be a converter that takes a value and converts
+    it.  If it raises :exc:`ValueError` or :exc:`TypeError` the default value
+    is used. If no default value is provided `None` is used.
+
+    Per default the property is read only.  You have to explicitly enable it
+    by passing ``read_only=False`` to the constructor.
+    """
+
+    read_only = True
+
+    def lookup(self, obj: Request) -> WSGIEnvironment:
+        return obj.environ
+
+
+class header_property(_DictAccessorProperty[_TAccessorValue]):
+    """Like `environ_property` but for headers."""
+
+    def lookup(self, obj: Request | Response) -> Headers:  # type: ignore[override]
+        return obj.headers
+
+
+# https://cgit.freedesktop.org/xdg/shared-mime-info/tree/freedesktop.org.xml.in
+# https://www.iana.org/assignments/media-types/media-types.xhtml
+# Types listed in the XDG mime info that have a charset in the IANA registration.
+_charset_mimetypes = {
+    "application/ecmascript",
+    "application/javascript",
+    "application/sql",
+    "application/xml",
+    "application/xml-dtd",
+    "application/xml-external-parsed-entity",
+}
+
+
+def get_content_type(mimetype: str, charset: str) -> str:
+    """Returns the full content type string with charset for a mimetype.
+
+    If the mimetype represents text, the charset parameter will be
+    appended, otherwise the mimetype is returned unchanged.
+
+    :param mimetype: The mimetype to be used as content type.
+    :param charset: The charset to be appended for text mimetypes.
+    :return: The content type.
+
+    .. versionchanged:: 0.15
+        Any type that ends with ``+xml`` gets a charset, not just those
+        that start with ``application/``. Known text types such as
+        ``application/javascript`` are also given charsets.
+    """
+    if (
+        mimetype.startswith("text/")
+        or mimetype in _charset_mimetypes
+        or mimetype.endswith("+xml")
     ):
-        self.name: str = os.fspath(filename)
-        self.mode = mode
-        self.encoding = encoding
-        self.errors = errors
-        self.atomic = atomic
-        self._f: t.IO[t.Any] | None
-        self.should_close: bool
+        mimetype += f"; charset={charset}"
 
-        if self.name == "-":
-            self._f, self.should_close = open_stream(filename, mode, encoding, errors)
-        else:
-            if "r" in mode:
-                # Open and close the file in case we're opening it for
-                # reading so that we can catch at least some errors in
-                # some cases early.
-                open(filename, mode).close()
-            self._f = None
-            self.should_close = True
-
-    def __getattr__(self, name: str) -> t.Any:
-        return getattr(self.open(), name)
-
-    def __repr__(self) -> str:
-        if self._f is not None:
-            return repr(self._f)
-        return f"<unopened file '{format_filename(self.name)}' {self.mode}>"
-
-    def open(self) -> t.IO[t.Any]:
-        """Opens the file if it's not yet open.  This call might fail with
-        a :exc:`FileError`.  Not handling this error will produce an error
-        that Click shows.
-        """
-        if self._f is not None:
-            return self._f
-        try:
-            rv, self.should_close = open_stream(
-                self.name, self.mode, self.encoding, self.errors, atomic=self.atomic
-            )
-        except OSError as e:
-            from .exceptions import FileError
-
-            raise FileError(self.name, hint=e.strerror) from e
-        self._f = rv
-        return rv
-
-    def close(self) -> None:
-        """Closes the underlying file, no matter what."""
-        if self._f is not None:
-            self._f.close()
-
-    def close_intelligently(self) -> None:
-        """This function only closes the file if it was opened by the lazy
-        file wrapper.  For instance this will never close stdin.
-        """
-        if self.should_close:
-            self.close()
-
-    def __enter__(self) -> LazyFile:
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self.close_intelligently()
-
-    def __iter__(self) -> cabc.Iterator[t.AnyStr]:
-        self.open()
-        return iter(self._f)  # type: ignore
+    return mimetype
 
 
-class KeepOpenFile:
-    def __init__(self, file: t.IO[t.Any]) -> None:
-        self._file: t.IO[t.Any] = file
+def secure_filename(filename: str) -> str:
+    r"""Pass it a filename and it will return a secure version of it.  This
+    filename can then safely be stored on a regular file system and passed
+    to :func:`os.path.join`.  The filename returned is an ASCII only string
+    for maximum portability.
 
-    def __getattr__(self, name: str) -> t.Any:
-        return getattr(self._file, name)
+    On windows systems the function also makes sure that the file is not
+    named after one of the special device files.
 
-    def __enter__(self) -> KeepOpenFile:
-        return self
+    >>> secure_filename("My cool movie.mov")
+    'My_cool_movie.mov'
+    >>> secure_filename("../../../etc/passwd")
+    'etc_passwd'
+    >>> secure_filename('i contain cool \xfcml\xe4uts.txt')
+    'i_contain_cool_umlauts.txt'
 
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        pass
+    The function might return an empty filename.  It's your responsibility
+    to ensure that the filename is unique and that you abort or
+    generate a random filename if the function returned an empty one.
 
-    def __repr__(self) -> str:
-        return repr(self._file)
+    .. versionadded:: 0.5
 
-    def __iter__(self) -> cabc.Iterator[t.AnyStr]:
-        return iter(self._file)
-
-
-def echo(
-    message: t.Any | None = None,
-    file: t.IO[t.Any] | None = None,
-    nl: bool = True,
-    err: bool = False,
-    color: bool | None = None,
-) -> None:
-    """Print a message and newline to stdout or a file. This should be
-    used instead of :func:`print` because it provides better support
-    for different data, files, and environments.
-
-    Compared to :func:`print`, this does the following:
-
-    -   Ensures that the output encoding is not misconfigured on Linux.
-    -   Supports Unicode in the Windows console.
-    -   Supports writing to binary outputs, and supports writing bytes
-        to text outputs.
-    -   Supports colors and styles on Windows.
-    -   Removes ANSI color and style codes if the output does not look
-        like an interactive terminal.
-    -   Always flushes the output.
-
-    :param message: The string or bytes to output. Other objects are
-        converted to strings.
-    :param file: The file to write to. Defaults to ``stdout``.
-    :param err: Write to ``stderr`` instead of ``stdout``.
-    :param nl: Print a newline after the message. Enabled by default.
-    :param color: Force showing or hiding colors and other styles. By
-        default Click will remove color if the output does not look like
-        an interactive terminal.
-
-    .. versionchanged:: 6.0
-        Support Unicode output on the Windows console. Click does not
-        modify ``sys.stdout``, so ``sys.stdout.write()`` and ``print()``
-        will still not support Unicode.
-
-    .. versionchanged:: 4.0
-        Added the ``color`` parameter.
-
-    .. versionadded:: 3.0
-        Added the ``err`` parameter.
-
-    .. versionchanged:: 2.0
-        Support colors on Windows if colorama is installed.
+    :param filename: the filename to secure
     """
-    if file is None:
-        if err:
-            file = _default_text_stderr()
-        else:
-            file = _default_text_stdout()
+    filename = unicodedata.normalize("NFKD", filename)
+    filename = filename.encode("ascii", "ignore").decode("ascii")
 
-        # There are no standard streams attached to write to. For example,
-        # pythonw on Windows.
-        if file is None:
-            return
+    for sep in os.sep, os.path.altsep:
+        if sep:
+            filename = filename.replace(sep, " ")
+    filename = str(_filename_ascii_strip_re.sub("", "_".join(filename.split()))).strip(
+        "._"
+    )
 
-    # Convert non bytes/text into the native string type.
-    if message is not None and not isinstance(message, (str, bytes, bytearray)):
-        out: str | bytes | bytearray | None = str(message)
-    else:
-        out = message
-
-    if nl:
-        out = out or ""
-        if isinstance(out, str):
-            out += "\n"
-        else:
-            out += b"\n"
-
-    if not out:
-        file.flush()
-        return
-
-    # If there is a message and the value looks like bytes, we manually
-    # need to find the binary stream and write the message in there.
-    # This is done separately so that most stream types will work as you
-    # would expect. Eg: you can write to StringIO for other cases.
-    if isinstance(out, (bytes, bytearray)):
-        binary_file = _find_binary_writer(file)
-
-        if binary_file is not None:
-            file.flush()
-            binary_file.write(out)
-            binary_file.flush()
-            return
-
-    # ANSI style code support. For no message or bytes, nothing happens.
-    # When outputting to a file instead of a terminal, strip codes.
-    else:
-        color = resolve_color_default(color)
-
-        if should_strip_ansi(file, color):
-            out = strip_ansi(out)
-        elif WIN:
-            if auto_wrap_for_ansi is not None:
-                file = auto_wrap_for_ansi(file, color)  # type: ignore
-            elif not color:
-                out = strip_ansi(out)
-
-    file.write(out)  # type: ignore
-    file.flush()
-
-
-def get_binary_stream(name: t.Literal["stdin", "stdout", "stderr"]) -> t.BinaryIO:
-    """Returns a system stream for byte processing.
-
-    :param name: the name of the stream to open.  Valid names are ``'stdin'``,
-                 ``'stdout'`` and ``'stderr'``
-    """
-    opener = binary_streams.get(name)
-    if opener is None:
-        raise TypeError(f"Unknown standard stream '{name}'")
-    return opener()
-
-
-def get_text_stream(
-    name: t.Literal["stdin", "stdout", "stderr"],
-    encoding: str | None = None,
-    errors: str | None = "strict",
-) -> t.TextIO:
-    """Returns a system stream for text processing.  This usually returns
-    a wrapped stream around a binary stream returned from
-    :func:`get_binary_stream` but it also can take shortcuts for already
-    correctly configured streams.
-
-    :param name: the name of the stream to open.  Valid names are ``'stdin'``,
-                 ``'stdout'`` and ``'stderr'``
-    :param encoding: overrides the detected default encoding.
-    :param errors: overrides the default error mode.
-    """
-    opener = text_streams.get(name)
-    if opener is None:
-        raise TypeError(f"Unknown standard stream '{name}'")
-    return opener(encoding, errors)
-
-
-def open_file(
-    filename: str | os.PathLike[str],
-    mode: str = "r",
-    encoding: str | None = None,
-    errors: str | None = "strict",
-    lazy: bool = False,
-    atomic: bool = False,
-) -> t.IO[t.Any]:
-    """Open a file, with extra behavior to handle ``'-'`` to indicate
-    a standard stream, lazy open on write, and atomic write. Similar to
-    the behavior of the :class:`~click.File` param type.
-
-    If ``'-'`` is given to open ``stdout`` or ``stdin``, the stream is
-    wrapped so that using it in a context manager will not close it.
-    This makes it possible to use the function without accidentally
-    closing a standard stream:
-
-    .. code-block:: python
-
-        with open_file(filename) as f:
-            ...
-
-    :param filename: The name or Path of the file to open, or ``'-'`` for
-        ``stdin``/``stdout``.
-    :param mode: The mode in which to open the file.
-    :param encoding: The encoding to decode or encode a file opened in
-        text mode.
-    :param errors: The error handling mode.
-    :param lazy: Wait to open the file until it is accessed. For read
-        mode, the file is temporarily opened to raise access errors
-        early, then closed until it is read again.
-    :param atomic: Write to a temporary file and replace the given file
-        on close.
-
-    .. versionadded:: 3.0
-    """
-    if lazy:
-        return t.cast(
-            "t.IO[t.Any]", LazyFile(filename, mode, encoding, errors, atomic=atomic)
-        )
-
-    f, should_close = open_stream(filename, mode, encoding, errors, atomic=atomic)
-
-    if not should_close:
-        f = t.cast("t.IO[t.Any]", KeepOpenFile(f))
-
-    return f
-
-
-def format_filename(
-    filename: str | bytes | os.PathLike[str] | os.PathLike[bytes],
-    shorten: bool = False,
-) -> str:
-    """Format a filename as a string for display. Ensures the filename can be
-    displayed by replacing any invalid bytes or surrogate escapes in the name
-    with the replacement character ``�``.
-
-    Invalid bytes or surrogate escapes will raise an error when written to a
-    stream with ``errors="strict"``. This will typically happen with ``stdout``
-    when the locale is something like ``en_GB.UTF-8``.
-
-    Many scenarios *are* safe to write surrogates though, due to PEP 538 and
-    PEP 540, including:
-
-    -   Writing to ``stderr``, which uses ``errors="backslashreplace"``.
-    -   The system has ``LANG=C.UTF-8``, ``C``, or ``POSIX``. Python opens
-        stdout and stderr with ``errors="surrogateescape"``.
-    -   None of ``LANG/LC_*`` are set. Python assumes ``LANG=C.UTF-8``.
-    -   Python is started in UTF-8 mode  with  ``PYTHONUTF8=1`` or ``-X utf8``.
-        Python opens stdout and stderr with ``errors="surrogateescape"``.
-
-    :param filename: formats a filename for UI display.  This will also convert
-                     the filename into unicode without failing.
-    :param shorten: this optionally shortens the filename to strip of the
-                    path that leads up to it.
-    """
-    if shorten:
-        filename = os.path.basename(filename)
-    else:
-        filename = os.fspath(filename)
-
-    if isinstance(filename, bytes):
-        filename = filename.decode(sys.getfilesystemencoding(), "replace")
-    else:
-        filename = filename.encode("utf-8", "surrogateescape").decode(
-            "utf-8", "replace"
-        )
+    # on nt a couple of special files are present in each folder.  We
+    # have to ensure that the target file is not such a filename.  In
+    # this case we prepend an underline
+    if (
+        os.name == "nt"
+        and filename
+        and filename.split(".")[0].upper() in _windows_device_files
+    ):
+        filename = f"_{filename}"
 
     return filename
 
 
-def get_app_dir(app_name: str, roaming: bool = True, force_posix: bool = False) -> str:
-    r"""Returns the config folder for the application.  The default behavior
-    is to return whatever is most appropriate for the operating system.
+def redirect(
+    location: str, code: int = 302, Response: type[Response] | None = None
+) -> Response:
+    """Returns a response object (a WSGI application) that, if called,
+    redirects the client to the target location. Supported codes are
+    301, 302, 303, 305, 307, and 308. 300 is not supported because
+    it's not a real redirect and 304 because it's the answer for a
+    request with a request with defined If-Modified-Since headers.
 
-    To give you an idea, for an app called ``"Foo Bar"``, something like
-    the following folders could be returned:
+    .. versionadded:: 0.6
+       The location can now be a unicode string that is encoded using
+       the :func:`iri_to_uri` function.
 
-    Mac OS X:
-      ``~/Library/Application Support/Foo Bar``
-    Mac OS X (POSIX):
-      ``~/.foo-bar``
-    Unix:
-      ``~/.config/foo-bar``
-    Unix (POSIX):
-      ``~/.foo-bar``
-    Windows (roaming):
-      ``C:\Users\<user>\AppData\Roaming\Foo Bar``
-    Windows (not roaming):
-      ``C:\Users\<user>\AppData\Local\Foo Bar``
+    .. versionadded:: 0.10
+        The class used for the Response object can now be passed in.
+
+    :param location: the location the response should redirect to.
+    :param code: the redirect status code. defaults to 302.
+    :param class Response: a Response class to use when instantiating a
+        response. The default is :class:`werkzeug.wrappers.Response` if
+        unspecified.
+    """
+    if Response is None:
+        from .wrappers import Response
+
+    html_location = escape(location)
+    response = Response(  # type: ignore[misc]
+        "<!doctype html>\n"
+        "<html lang=en>\n"
+        "<title>Redirecting...</title>\n"
+        "<h1>Redirecting...</h1>\n"
+        "<p>You should be redirected automatically to the target URL: "
+        f'<a href="{html_location}">{html_location}</a>. If not, click the link.\n',
+        code,
+        mimetype="text/html",
+    )
+    response.headers["Location"] = location
+    return response
+
+
+def append_slash_redirect(environ: WSGIEnvironment, code: int = 308) -> Response:
+    """Redirect to the current URL with a slash appended.
+
+    If the current URL is ``/user/42``, the redirect URL will be
+    ``42/``. When joined to the current URL during response
+    processing or by the browser, this will produce ``/user/42/``.
+
+    The behavior is undefined if the path ends with a slash already. If
+    called unconditionally on a URL, it may produce a redirect loop.
+
+    :param environ: Use the path and query from this WSGI environment
+        to produce the redirect URL.
+    :param code: the status code for the redirect.
+
+    .. versionchanged:: 2.1
+        Produce a relative URL that only modifies the last segment.
+        Relevant when the current path has multiple segments.
+
+    .. versionchanged:: 2.1
+        The default status code is 308 instead of 301. This preserves
+        the request method and body.
+    """
+    tail = environ["PATH_INFO"].rpartition("/")[2]
+
+    if not tail:
+        new_path = "./"
+    else:
+        new_path = f"{tail}/"
+
+    query_string = environ.get("QUERY_STRING")
+
+    if query_string:
+        new_path = f"{new_path}?{query_string}"
+
+    return redirect(new_path, code)
+
+
+def send_file(
+    path_or_file: os.PathLike[str] | str | t.IO[bytes],
+    environ: WSGIEnvironment,
+    mimetype: str | None = None,
+    as_attachment: bool = False,
+    download_name: str | None = None,
+    conditional: bool = True,
+    etag: bool | str = True,
+    last_modified: datetime | int | float | None = None,
+    max_age: None | (int | t.Callable[[str | None], int | None]) = None,
+    use_x_sendfile: bool = False,
+    response_class: type[Response] | None = None,
+    _root_path: os.PathLike[str] | str | None = None,
+) -> Response:
+    """Send the contents of a file to the client.
+
+    The first argument can be a file path or a file-like object. Paths
+    are preferred in most cases because Werkzeug can manage the file and
+    get extra information from the path. Passing a file-like object
+    requires that the file is opened in binary mode, and is mostly
+    useful when building a file in memory with :class:`io.BytesIO`.
+
+    Never pass file paths provided by a user. The path is assumed to be
+    trusted, so a user could craft a path to access a file you didn't
+    intend. Use :func:`send_from_directory` to safely serve user-provided paths.
+
+    If the WSGI server sets a ``file_wrapper`` in ``environ``, it is
+    used, otherwise Werkzeug's built-in wrapper is used. Alternatively,
+    if the HTTP server supports ``X-Sendfile``, ``use_x_sendfile=True``
+    will tell the server to send the given path, which is much more
+    efficient than reading it in Python.
+
+    :param path_or_file: The path to the file to send, relative to the
+        current working directory if a relative path is given.
+        Alternatively, a file-like object opened in binary mode. Make
+        sure the file pointer is seeked to the start of the data.
+    :param environ: The WSGI environ for the current request.
+    :param mimetype: The MIME type to send for the file. If not
+        provided, it will try to detect it from the file name.
+    :param as_attachment: Indicate to a browser that it should offer to
+        save the file instead of displaying it.
+    :param download_name: The default name browsers will use when saving
+        the file. Defaults to the passed file name.
+    :param conditional: Enable conditional and range responses based on
+        request headers. Requires passing a file path and ``environ``.
+    :param etag: Calculate an ETag for the file, which requires passing
+        a file path. Can also be a string to use instead.
+    :param last_modified: The last modified time to send for the file,
+        in seconds. If not provided, it will try to detect it from the
+        file path.
+    :param max_age: How long the client should cache the file, in
+        seconds. If set, ``Cache-Control`` will be ``public``, otherwise
+        it will be ``no-cache`` to prefer conditional caching.
+    :param use_x_sendfile: Set the ``X-Sendfile`` header to let the
+        server to efficiently send the file. Requires support from the
+        HTTP server. Requires passing a file path.
+    :param response_class: Build the response using this class. Defaults
+        to :class:`~werkzeug.wrappers.Response`.
+    :param _root_path: Do not use. For internal use only. Use
+        :func:`send_from_directory` to safely send files under a path.
+
+    .. versionchanged:: 2.0.2
+        ``send_file`` only sets a detected ``Content-Encoding`` if
+        ``as_attachment`` is disabled.
 
     .. versionadded:: 2.0
+        Adapted from Flask's implementation.
 
-    :param app_name: the application name.  This should be properly capitalized
-                     and can contain whitespace.
-    :param roaming: controls if the folder should be roaming or not on Windows.
-                    Has no effect otherwise.
-    :param force_posix: if this is set to `True` then on any POSIX system the
-                        folder will be stored in the home folder with a leading
-                        dot instead of the XDG config home or darwin's
-                        application support folder.
+    .. versionchanged:: 2.0
+        ``download_name`` replaces Flask's ``attachment_filename``
+         parameter. If ``as_attachment=False``, it is passed with
+         ``Content-Disposition: inline`` instead.
+
+    .. versionchanged:: 2.0
+        ``max_age`` replaces Flask's ``cache_timeout`` parameter.
+        ``conditional`` is enabled and ``max_age`` is not set by
+        default.
+
+    .. versionchanged:: 2.0
+        ``etag`` replaces Flask's ``add_etags`` parameter. It can be a
+        string to use instead of generating one.
+
+    .. versionchanged:: 2.0
+        If an encoding is returned when guessing ``mimetype`` from
+        ``download_name``, set the ``Content-Encoding`` header.
     """
-    if WIN:
-        key = "APPDATA" if roaming else "LOCALAPPDATA"
-        folder = os.environ.get(key)
-        if folder is None:
-            folder = os.path.expanduser("~")
-        return os.path.join(folder, app_name)
-    if force_posix:
-        return os.path.join(os.path.expanduser(f"~/.{_posixify(app_name)}"))
-    if sys.platform == "darwin":
-        return os.path.join(
-            os.path.expanduser("~/Library/Application Support"), app_name
+    if response_class is None:
+        from .wrappers import Response
+
+        response_class = Response
+
+    path: str | None = None
+    file: t.IO[bytes] | None = None
+    size: int | None = None
+    mtime: float | None = None
+    headers = Headers()
+
+    if isinstance(path_or_file, (os.PathLike, str)) or hasattr(
+        path_or_file, "__fspath__"
+    ):
+        path_or_file = t.cast("os.PathLike[str] | str", path_or_file)
+
+        # Flask will pass app.root_path, allowing its send_file wrapper
+        # to not have to deal with paths.
+        if _root_path is not None:
+            path = os.path.join(_root_path, path_or_file)
+        else:
+            path = os.path.abspath(path_or_file)
+
+        stat = os.stat(path)
+        size = stat.st_size
+        mtime = stat.st_mtime
+    else:
+        file = path_or_file
+
+    if download_name is None and path is not None:
+        download_name = os.path.basename(path)
+
+    if mimetype is None:
+        if download_name is None:
+            raise TypeError(
+                "Unable to detect the MIME type because a file name is"
+                " not available. Either set 'download_name', pass a"
+                " path instead of a file, or set 'mimetype'."
+            )
+
+        mimetype, encoding = mimetypes.guess_type(download_name)
+
+        if mimetype is None:
+            mimetype = "application/octet-stream"
+
+        # Don't send encoding for attachments, it causes browsers to
+        # save decompress tar.gz files.
+        if encoding is not None and not as_attachment:
+            headers.set("Content-Encoding", encoding)
+
+    if download_name is not None:
+        try:
+            download_name.encode("ascii")
+        except UnicodeEncodeError:
+            simple = unicodedata.normalize("NFKD", download_name)
+            simple = simple.encode("ascii", "ignore").decode("ascii")
+            # safe = RFC 5987 attr-char
+            quoted = quote(download_name, safe="!#$&+-.^_`|~")
+            names = {"filename": simple, "filename*": f"UTF-8''{quoted}"}
+        else:
+            names = {"filename": download_name}
+
+        value = "attachment" if as_attachment else "inline"
+        headers.set("Content-Disposition", value, **names)
+    elif as_attachment:
+        raise TypeError(
+            "No name provided for attachment. Either set"
+            " 'download_name' or pass a path instead of a file."
         )
-    return os.path.join(
-        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
-        _posixify(app_name),
+
+    if use_x_sendfile and path is not None:
+        headers["X-Sendfile"] = path
+        data = None
+    else:
+        if file is None:
+            file = open(path, "rb")  # type: ignore
+        elif isinstance(file, io.BytesIO):
+            size = file.getbuffer().nbytes
+        elif isinstance(file, io.TextIOBase):
+            raise ValueError("Files must be opened in binary mode or use BytesIO.")
+
+        data = wrap_file(environ, file)
+
+    rv = response_class(
+        data, mimetype=mimetype, headers=headers, direct_passthrough=True
     )
 
+    if size is not None:
+        rv.content_length = size
 
-class PacifyFlushWrapper:
-    """This wrapper is used to catch and suppress BrokenPipeErrors resulting
-    from ``.flush()`` being called on broken pipe during the shutdown/final-GC
-    of the Python interpreter. Notably ``.flush()`` is always called on
-    ``sys.stdout`` and ``sys.stderr``. So as to have minimal impact on any
-    other cleanup code, and the case where the underlying file is not a broken
-    pipe, all calls and attributes are proxied.
-    """
+    if last_modified is not None:
+        rv.last_modified = last_modified  # type: ignore
+    elif mtime is not None:
+        rv.last_modified = mtime  # type: ignore
 
-    def __init__(self, wrapped: t.IO[t.Any]) -> None:
-        self.wrapped = wrapped
+    rv.cache_control.no_cache = True
 
-    def flush(self) -> None:
+    # Flask will pass app.get_send_file_max_age, allowing its send_file
+    # wrapper to not have to deal with paths.
+    if callable(max_age):
+        max_age = max_age(path)
+
+    if max_age is not None:
+        if max_age > 0:
+            rv.cache_control.no_cache = None
+            rv.cache_control.public = True
+
+        rv.cache_control.max_age = max_age
+        rv.expires = int(time() + max_age)  # type: ignore
+
+    if isinstance(etag, str):
+        rv.set_etag(etag)
+    elif etag and path is not None:
+        check = adler32(path.encode()) & 0xFFFFFFFF
+        rv.set_etag(f"{mtime}-{size}-{check}")
+
+    if conditional:
         try:
-            self.wrapped.flush()
-        except OSError as e:
-            import errno
+            rv = rv.make_conditional(environ, accept_ranges=True, complete_length=size)
+        except RequestedRangeNotSatisfiable:
+            if file is not None:
+                file.close()
 
-            if e.errno != errno.EPIPE:
+            raise
+
+        # Some x-sendfile implementations incorrectly ignore the 304
+        # status code and send the file anyway.
+        if rv.status_code == 304:
+            rv.headers.pop("x-sendfile", None)
+
+    return rv
+
+
+def send_from_directory(
+    directory: os.PathLike[str] | str,
+    path: os.PathLike[str] | str,
+    environ: WSGIEnvironment,
+    **kwargs: t.Any,
+) -> Response:
+    """Send a file from within a directory using :func:`send_file`.
+
+    This is a secure way to serve files from a folder, such as static
+    files or uploads. Uses :func:`~werkzeug.security.safe_join` to
+    ensure the path coming from the client is not maliciously crafted to
+    point outside the specified directory.
+
+    If the final path does not point to an existing regular file,
+    returns a 404 :exc:`~werkzeug.exceptions.NotFound` error.
+
+    :param directory: The directory that ``path`` must be located under. This *must not*
+        be a value provided by the client, otherwise it becomes insecure.
+    :param path: The path to the file to send, relative to ``directory``. This is the
+        part of the path provided by the client, which is checked for security.
+    :param environ: The WSGI environ for the current request.
+    :param kwargs: Arguments to pass to :func:`send_file`.
+
+    .. versionadded:: 2.0
+        Adapted from Flask's implementation.
+    """
+    path_str = safe_join(os.fspath(directory), os.fspath(path))
+
+    if path_str is None:
+        raise NotFound()
+
+    # Flask will pass app.root_path, allowing its send_from_directory
+    # wrapper to not have to deal with paths.
+    if "_root_path" in kwargs:
+        path_str = os.path.join(kwargs["_root_path"], path_str)
+
+    if not os.path.isfile(path_str):
+        raise NotFound()
+
+    return send_file(path_str, environ, **kwargs)
+
+
+def import_string(import_name: str, silent: bool = False) -> t.Any:
+    """Imports an object based on a string.  This is useful if you want to
+    use import paths as endpoints or something similar.  An import path can
+    be specified either in dotted notation (``xml.sax.saxutils.escape``)
+    or with a colon as object delimiter (``xml.sax.saxutils:escape``).
+
+    If `silent` is True the return value will be `None` if the import fails.
+
+    :param import_name: the dotted name for the object to import.
+    :param silent: if set to `True` import errors are ignored and
+                   `None` is returned instead.
+    :return: imported object
+    """
+    import_name = import_name.replace(":", ".")
+    try:
+        try:
+            __import__(import_name)
+        except ImportError:
+            if "." not in import_name:
                 raise
-
-    def __getattr__(self, attr: str) -> t.Any:
-        return getattr(self.wrapped, attr)
-
-
-def _detect_program_name(
-    path: str | None = None, _main: ModuleType | None = None
-) -> str:
-    """Determine the command used to run the program, for use in help
-    text. If a file or entry point was executed, the file name is
-    returned. If ``python -m`` was used to execute a module or package,
-    ``python -m name`` is returned.
-
-    This doesn't try to be too precise, the goal is to give a concise
-    name for help text. Files are only shown as their name without the
-    path. ``python`` is only shown for modules, and the full path to
-    ``sys.executable`` is not shown.
-
-    :param path: The Python file being executed. Python puts this in
-        ``sys.argv[0]``, which is used by default.
-    :param _main: The ``__main__`` module. This should only be passed
-        during internal testing.
-
-    .. versionadded:: 8.0
-        Based on command args detection in the Werkzeug reloader.
-
-    :meta private:
-    """
-    if _main is None:
-        _main = sys.modules["__main__"]
-
-    if not path:
-        path = sys.argv[0]
-
-    # The value of __package__ indicates how Python was called. It may
-    # not exist if a setuptools script is installed as an egg. It may be
-    # set incorrectly for entry points created with pip on Windows.
-    # It is set to "" inside a Shiv or PEX zipapp.
-    if getattr(_main, "__package__", None) in {None, ""} or (
-        os.name == "nt"
-        and _main.__package__ == ""
-        and not os.path.exists(path)
-        and os.path.exists(f"{path}.exe")
-    ):
-        # Executed a file, like "python app.py".
-        return os.path.basename(path)
-
-    # Executed a module, like "python -m example".
-    # Rewritten by Python from "-m script" to "/path/to/script.py".
-    # Need to look at main module to determine how it was executed.
-    py_module = t.cast(str, _main.__package__)
-    name = os.path.splitext(os.path.basename(path))[0]
-
-    # A submodule like "example.cli".
-    if name != "__main__":
-        py_module = f"{py_module}.{name}"
-
-    return f"python -m {py_module.lstrip('.')}"
-
-
-def _expand_args(
-    args: cabc.Iterable[str],
-    *,
-    user: bool = True,
-    env: bool = True,
-    glob_recursive: bool = True,
-) -> list[str]:
-    """Simulate Unix shell expansion with Python functions.
-
-    See :func:`glob.glob`, :func:`os.path.expanduser`, and
-    :func:`os.path.expandvars`.
-
-    This is intended for use on Windows, where the shell does not do any
-    expansion. It may not exactly match what a Unix shell would do.
-
-    :param args: List of command line arguments to expand.
-    :param user: Expand user home directory.
-    :param env: Expand environment variables.
-    :param glob_recursive: ``**`` matches directories recursively.
-
-    .. versionchanged:: 8.1
-        Invalid glob patterns are treated as empty expansions rather
-        than raising an error.
-
-    .. versionadded:: 8.0
-
-    :meta private:
-    """
-    from glob import glob
-
-    out = []
-
-    for arg in args:
-        if user:
-            arg = os.path.expanduser(arg)
-
-        if env:
-            arg = os.path.expandvars(arg)
-
-        try:
-            matches = glob(arg, recursive=glob_recursive)
-        except re.error:
-            matches = []
-
-        if not matches:
-            out.append(arg)
         else:
-            out.extend(matches)
+            return sys.modules[import_name]
 
-    return out
+        module_name, obj_name = import_name.rsplit(".", 1)
+        module = __import__(module_name, globals(), locals(), [obj_name])
+        try:
+            return getattr(module, obj_name)
+        except AttributeError as e:
+            raise ImportError(e) from None
+
+    except ImportError as e:
+        if not silent:
+            raise ImportStringError(import_name, e).with_traceback(
+                sys.exc_info()[2]
+            ) from None
+
+    return None
+
+
+def find_modules(
+    import_path: str, include_packages: bool = False, recursive: bool = False
+) -> t.Iterator[str]:
+    """Finds all the modules below a package.  This can be useful to
+    automatically import all views / controllers so that their metaclasses /
+    function decorators have a chance to register themselves on the
+    application.
+
+    Packages are not returned unless `include_packages` is `True`.  This can
+    also recursively list modules but in that case it will import all the
+    packages to get the correct load path of that module.
+
+    :param import_path: the dotted name for the package to find child modules.
+    :param include_packages: set to `True` if packages should be returned, too.
+    :param recursive: set to `True` if recursion should happen.
+    :return: generator
+    """
+    module = import_string(import_path)
+    path = getattr(module, "__path__", None)
+    if path is None:
+        raise ValueError(f"{import_path!r} is not a package")
+    basename = f"{module.__name__}."
+    for _importer, modname, ispkg in pkgutil.iter_modules(path):
+        modname = basename + modname
+        if ispkg:
+            if include_packages:
+                yield modname
+            if recursive:
+                yield from find_modules(modname, include_packages, True)
+        else:
+            yield modname
+
+
+class ImportStringError(ImportError):
+    """Provides information about a failed :func:`import_string` attempt."""
+
+    #: String in dotted notation that failed to be imported.
+    import_name: str
+    #: Wrapped exception.
+    exception: BaseException
+
+    def __init__(self, import_name: str, exception: BaseException) -> None:
+        self.import_name = import_name
+        self.exception = exception
+        msg = import_name
+        name = ""
+        tracked = []
+        for part in import_name.replace(":", ".").split("."):
+            name = f"{name}.{part}" if name else part
+            imported = import_string(name, silent=True)
+            if imported:
+                tracked.append((name, getattr(imported, "__file__", None)))
+            else:
+                track = [f"- {n!r} found in {i!r}." for n, i in tracked]
+                track.append(f"- {name!r} not found.")
+                track_str = "\n".join(track)
+                msg = (
+                    f"import_string() failed for {import_name!r}. Possible reasons"
+                    f" are:\n\n"
+                    "- missing __init__.py in a package;\n"
+                    "- package or module path not included in sys.path;\n"
+                    "- duplicated package or module name taking precedence in"
+                    " sys.path;\n"
+                    "- missing module, class, function or variable;\n\n"
+                    f"Debugged import:\n\n{track_str}\n\n"
+                    f"Original exception:\n\n{type(exception).__name__}: {exception}"
+                )
+                break
+
+        super().__init__(msg)
+
+    def __repr__(self) -> str:
+        return f"<{type(self).__name__}({self.import_name!r}, {self.exception!r})>"
